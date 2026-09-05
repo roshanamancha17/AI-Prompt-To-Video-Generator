@@ -92,3 +92,10 @@ Phase 1 deploys anywhere Next.js + Postgres run (Vercel + a managed Postgres lik
 - `DATABASE.md` — schema walkthrough and versioning model
 - `AI_PROVIDERS.md` — provider abstraction and how to add a new AI/image/voice provider
 - `SOCIAL_PUBLISHING.md` — publishing architecture (Phase 7) and the export-only Phase 1–5 approach
+
+
+
+winget install OpenJS.NodeJS.LTS
+node --version
+npm --version
+npx prisma generate
