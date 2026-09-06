@@ -4,7 +4,7 @@ import { getStorageProvider } from '@/lib/providers/storage/S3StorageProvider';
 import type { ResolvedImagePrompt } from '@/lib/providers/image/ImageProvider';
 import { runTrackedJob } from './jobService';
 
-function toResolvedPrompt(row: {
+export function toResolvedPrompt(row: {
   subject: string;
   environment: string;
   action: string | null;
@@ -36,6 +36,38 @@ function dataUrlToBuffer(dataUrl: string): { buffer: Buffer; mimeType: string } 
   return { buffer: Buffer.from(match[2], 'base64'), mimeType: match[1] };
 }
 
+/**
+ * Uploads a generated image (as a data: URL) to storage and records it as
+ * the new active GeneratedImage for a prompt. Shared by the normal
+ * ImageProvider flow below AND the RTX job-completion route, which
+ * can't go through getImageProvider().generateImage() itself since RTX
+ * generation is job-based (start/poll), not a single blocking call.
+ */
+export async function persistGeneratedImage(params: {
+  imagePromptId: string;
+  projectId: string;
+  assetUrlDataUri: string;
+  provider: string;
+  model: string;
+}) {
+  const { buffer, mimeType } = dataUrlToBuffer(params.assetUrlDataUri);
+  const ext = mimeType.includes('png') ? 'png' : 'jpg';
+  const key = `projects/${params.projectId}/images/${params.imagePromptId}-${Date.now()}.${ext}`;
+  const uploaded = await getStorageProvider().upload(key, buffer, mimeType);
+
+  return prisma.$transaction(async (tx) => {
+    const asset = await tx.asset.create({
+      data: { projectId: params.projectId, type: 'IMAGE', url: uploaded.url, storageProvider: getStorageProvider().name, sizeBytes: uploaded.sizeBytes, mimeType },
+    });
+
+    await tx.generatedImage.updateMany({ where: { imagePromptId: params.imagePromptId }, data: { isActive: false } });
+
+    return tx.generatedImage.create({
+      data: { imagePromptId: params.imagePromptId, isActive: true, provider: params.provider, model: params.model, assetId: asset.id },
+    });
+  });
+}
+
 /** Generates one image for one ImagePrompt row. Independent of every other prompt — regenerating one scene never touches another. */
 export async function generateImageForPrompt(imagePromptId: string) {
   const imagePrompt = await prisma.imagePrompt.findUniqueOrThrow({
@@ -52,22 +84,12 @@ export async function generateImageForPrompt(imagePromptId: string) {
 
   return runTrackedJob(projectId, 'IMAGES', async () => {
     const result = await getImageProvider().generateImage(toResolvedPrompt(imagePrompt));
-    const { buffer, mimeType } = dataUrlToBuffer(result.assetUrl);
-
-    const ext = mimeType.includes('png') ? 'png' : 'jpg';
-    const key = `projects/${projectId}/images/${imagePromptId}-${Date.now()}.${ext}`;
-    const uploaded = await getStorageProvider().upload(key, buffer, mimeType);
-
-    return prisma.$transaction(async (tx) => {
-      const asset = await tx.asset.create({
-        data: { projectId, type: 'IMAGE', url: uploaded.url, storageProvider: getStorageProvider().name, sizeBytes: uploaded.sizeBytes, mimeType },
-      });
-
-      await tx.generatedImage.updateMany({ where: { imagePromptId }, data: { isActive: false } });
-
-      return tx.generatedImage.create({
-        data: { imagePromptId, isActive: true, provider: result.provider, model: result.model, assetId: asset.id },
-      });
+    return persistGeneratedImage({
+      imagePromptId,
+      projectId,
+      assetUrlDataUri: result.assetUrl,
+      provider: result.provider,
+      model: result.model,
     });
   });
 }

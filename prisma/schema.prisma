@@ -135,6 +135,12 @@ enum CtaLevel {
   LEVEL_5_DIRECT
 }
 
+enum ImageProviderMode {
+  UNSPLASH
+  RTX
+}
+
+
 model Project {
   id       String @id @default(cuid())
   userId   String
@@ -162,6 +168,13 @@ model Project {
   characterBible Json?
 
   maintainCharacterContinuity Boolean @default(true)
+
+  // Toggle between Unsplash (fast keyword search) and RTX (local GPU
+  // generation, detailed prompts) — read by both imagePromptService (to
+  // pick prompt style) and the image generation route (to pick which
+  // flow to call). Not the same as the global IMAGE_PROVIDER env var,
+  // which is the fallback/default when a project hasn't set this.
+  imageProviderMode ImageProviderMode @default(UNSPLASH)
 
   strategyApproved Boolean @default(false)
   scriptApproved   Boolean @default(false)

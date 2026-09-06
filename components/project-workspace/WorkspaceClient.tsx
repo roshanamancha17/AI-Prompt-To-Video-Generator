@@ -48,6 +48,7 @@ interface ProjectWithRelations {
   targetDurationSec: number;
   strategyApproved: boolean;
   scriptApproved: boolean;
+  imageProviderMode: 'UNSPLASH' | 'RTX';
   strategy: {
     coreProblem: string;
     emotion: string;
@@ -100,11 +101,17 @@ export function WorkspaceClient({ project }: { project: ProjectWithRelations }) 
   const [draftContent, setDraftContent] = useState(activeScript?.content ?? '');
   const [draftVoiceover, setDraftVoiceover] = useState(activeScript?.voiceoverVersion ?? '');
 
-useEffect(() => {
-  setDraftContent(activeScript?.content ?? '');
-  setDraftVoiceover(activeScript?.voiceoverVersion ?? '');
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [activeScript?.id]);
+  // The textareas above are local editable drafts, but activeScript comes
+  // from the server and changes after generation/regeneration/refine
+  // (router.refresh()) without remounting this component — so the drafts
+  // must be explicitly resynced whenever the underlying script version
+  // changes, or they'd keep showing whatever was there (often empty) at
+  // first mount.
+  useEffect(() => {
+    setDraftContent(activeScript?.content ?? '');
+    setDraftVoiceover(activeScript?.voiceoverVersion ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScript?.id]);
 
   const run = async (key: string, fn: () => Promise<Response>) => {
     setBusy(key);
@@ -164,11 +171,83 @@ useEffect(() => {
   const generateImagePrompts = () =>
     run('image-prompts', () => fetch('/api/generate/image-prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectId: project.id }) }));
 
-  const generateAllImages = () =>
-    run('images-all', () => fetch('/api/images/generate-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectId: project.id }) }));
+  const generateAllImages = async () => {
+    if (imageProviderMode === 'RTX') {
+      // RTX jobs run one at a time anyway (the Python server holds a
+      // single-generation lock — 8GB VRAM has no room for concurrent
+      // jobs), so "all" here just means "each prompt without an image
+      // yet, one after another" rather than a single bulk API call.
+      setBusy('images-all');
+      const pending = project.scenes.flatMap((s) => s.imagePrompts).filter((p) => !p.generatedImages[0]);
+      for (const p of pending) {
+        // eslint-disable-next-line no-await-in-loop
+        await generateOneImageRtx(p.id);
+      }
+      setBusy(null);
+      return;
+    }
+    await run('images-all', () => fetch('/api/images/generate-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectId: project.id }) }));
+  };
 
   const generateOneImage = (promptId: string) =>
     run(`image-${promptId}`, () => fetch(`/api/images/${promptId}/generate`, { method: 'POST' }));
+
+  // --- Image provider mode toggle (Unsplash vs RTX local GPU) ---
+  const [imageProviderMode, setImageProviderMode] = useState<'UNSPLASH' | 'RTX'>(project.imageProviderMode);
+  const [rtxProgress, setRtxProgress] = useState<Record<string, { step: number; totalSteps: number } | 'starting'>>({});
+
+  const setProviderMode = async (mode: 'UNSPLASH' | 'RTX') => {
+    setImageProviderMode(mode); // optimistic — instant toggle feel
+    await fetch(`/api/projects/${project.id}/image-provider-mode`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    router.refresh();
+  };
+
+  /** RTX generation is job-based (start -> poll) rather than one blocking call, since GPU generation takes real time and we want a live progress bar. */
+  const generateOneImageRtx = async (promptId: string) => {
+    setBusy(`image-${promptId}`);
+    setError(null);
+    setRtxProgress((prev) => ({ ...prev, [promptId]: 'starting' }));
+    try {
+      const startRes = await fetch(`/api/images/${promptId}/generate-rtx`, { method: 'POST' });
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.error || 'Could not start RTX generation.');
+      const { jobId, projectId } = startData;
+
+      // Poll every 1.5s until done or error — no websocket/SSE needed for
+      // a personal local tool, and this keeps both routes simple plain
+      // request/response handlers.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const statusRes = await fetch(`/api/images/rtx-status/${jobId}?promptId=${promptId}&projectId=${projectId}`);
+        const statusData = await statusRes.json();
+        if (!statusRes.ok) throw new Error(statusData.error || 'RTX generation failed.');
+
+        if (statusData.status === 'done') {
+          router.refresh();
+          break;
+        }
+        if (statusData.status === 'error') throw new Error(statusData.error || 'RTX generation failed.');
+        setRtxProgress((prev) => ({ ...prev, [promptId]: { step: statusData.step, totalSteps: statusData.totalSteps } }));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'RTX image generation failed. Please check your GPU server is running.');
+    } finally {
+      setRtxProgress((prev) => {
+        const next = { ...prev };
+        delete next[promptId];
+        return next;
+      });
+      setBusy(null);
+    }
+  };
+
+  /** Routes to the right flow based on the project's current toggle state. */
+  const generateImageSmart = (promptId: string) => (imageProviderMode === 'RTX' ? generateOneImageRtx(promptId) : generateOneImage(promptId));
 
   const generateThumbnails = () =>
     run('thumbnails', () => fetch('/api/generate/thumbnails', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectId: project.id }) }));
@@ -420,6 +499,32 @@ useEffect(() => {
             )}
           </CardHeader>
           <CardBody>
+            <div className="mb-4 flex items-center gap-2 rounded-md border border-ink-700 bg-ink-900 p-1">
+              <button
+                type="button"
+                onClick={() => setProviderMode('UNSPLASH')}
+                className={`flex-1 rounded-sm px-3 py-1.5 text-xs font-medium transition-colors ${
+                  imageProviderMode === 'UNSPLASH' ? 'bg-signal-amber text-ink-950' : 'text-ink-500 hover:text-paper-100'
+                }`}
+              >
+                Use Unsplash
+              </button>
+              <button
+                type="button"
+                onClick={() => setProviderMode('RTX')}
+                className={`flex-1 rounded-sm px-3 py-1.5 text-xs font-medium transition-colors ${
+                  imageProviderMode === 'RTX' ? 'bg-signal-amber text-ink-950' : 'text-ink-500 hover:text-paper-100'
+                }`}
+              >
+                Use RTX
+              </button>
+            </div>
+            <p className="mb-4 text-xs text-ink-500">
+              {imageProviderMode === 'UNSPLASH'
+                ? 'Fast keyword search against real stock photos — free, instant, best for generic scenes.'
+                : 'Detailed prompts rendered locally on your GPU — slower per image, full creative control. Requires rtx_server.py running.'}
+            </p>
+
             {project.scenes.length === 0 ? (
               <p className="py-6 text-center text-sm text-ink-500">Generate scenes first.</p>
             ) : !project.scenes.some((s) => s.imagePrompts.length > 0) ? (
@@ -431,27 +536,47 @@ useEffect(() => {
             ) : (
               <div className="grid grid-cols-2 gap-4">
                 {project.scenes.map((scene) =>
-                  scene.imagePrompts.map((prompt) => (
-                    <div key={prompt.id} className="rounded-md border border-ink-700 p-3">
-                      <p className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-500">Scene {scene.sceneNumber}</p>
-                      {prompt.generatedImages[0]?.asset?.url ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img src={prompt.generatedImages[0].asset.url} alt={`Scene ${scene.sceneNumber}`} className="mb-2 aspect-[9/16] w-full rounded-sm object-cover" />
-                      ) : (
-                        <div className="mb-2 flex aspect-[9/16] w-full items-center justify-center rounded-sm bg-ink-800 text-xs text-ink-500">No image yet</div>
-                      )}
-                      <p className="mb-2 line-clamp-3 text-xs text-ink-500">{prompt.subject}</p>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        className="w-full"
-                        onClick={() => generateOneImage(prompt.id)}
-                        disabled={busy === `image-${prompt.id}`}
-                      >
-                        {busy === `image-${prompt.id}` ? 'Generating…' : prompt.generatedImages[0] ? 'Regenerate' : 'Generate Image'}
-                      </Button>
-                    </div>
-                  )),
+                  scene.imagePrompts.map((prompt) => {
+                    const progress = rtxProgress[prompt.id];
+                    return (
+                      <div key={prompt.id} className="rounded-md border border-ink-700 p-3">
+                        <p className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-500">Scene {scene.sceneNumber}</p>
+                        {prompt.generatedImages[0]?.asset?.url ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={prompt.generatedImages[0].asset.url} alt={`Scene ${scene.sceneNumber}`} className="mb-2 aspect-[9/16] w-full rounded-sm object-cover" />
+                        ) : (
+                          <div className="mb-2 flex aspect-[9/16] w-full items-center justify-center rounded-sm bg-ink-800 text-xs text-ink-500">No image yet</div>
+                        )}
+                        <p className="mb-2 line-clamp-3 text-xs text-ink-500">{prompt.subject}</p>
+
+                        {progress && (
+                          <div className="mb-2">
+                            <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink-800">
+                              <div
+                                className="h-full rounded-full bg-signal-amber transition-all"
+                                style={{
+                                  width: progress === 'starting' ? '5%' : `${Math.min(100, Math.round((progress.step / Math.max(progress.totalSteps, 1)) * 100))}%`,
+                                }}
+                              />
+                            </div>
+                            <p className="mt-1 text-[11px] text-ink-500">
+                              {progress === 'starting' ? 'Loading model…' : `Step ${progress.step} of ${progress.totalSteps}`}
+                            </p>
+                          </div>
+                        )}
+
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="w-full"
+                          onClick={() => generateImageSmart(prompt.id)}
+                          disabled={busy === `image-${prompt.id}`}
+                        >
+                          {busy === `image-${prompt.id}` ? 'Generating…' : prompt.generatedImages[0] ? 'Regenerate' : 'Generate Image'}
+                        </Button>
+                      </div>
+                    );
+                  }),
                 )}
               </div>
             )}

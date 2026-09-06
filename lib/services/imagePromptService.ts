@@ -1,6 +1,5 @@
 import { prisma } from '@/lib/db/prisma';
 import { getAIProvider } from '@/lib/providers/ai/GeminiTextProvider';
-import { isPrimaryImageProviderSearchBased } from '@/lib/providers/image/registry';
 import { ScenePromptListSchema, ScenePromptListJsonSchema } from '@/lib/schemas/imagePrompt.schema';
 import type { CharacterBibleOutput } from '@/lib/schemas/imagePrompt.schema';
 import { buildProjectBrief } from './promptBuilders';
@@ -17,7 +16,11 @@ export async function generateImagePrompts(projectId: string) {
 
   return runTrackedJob(projectId, 'IMAGE_PROMPTS', async () => {
     const brief = await buildProjectBrief(project);
-    const usingSearchProvider = isPrimaryImageProviderSearchBased();
+    // Per-project toggle (Unsplash vs RTX), not the global IMAGE_PROVIDER
+    // env var — set from the Images tab UI. Unsplash needs generic
+    // search keywords; RTX (local GPU generation) needs the full
+    // detailed generative prompt, same as Gemini/hosted SD.
+    const usingSearchProvider = project.imageProviderMode === 'UNSPLASH';
 
     // Search-based providers (Unsplash) match against real existing
     // photos by generic keyword, not by rendering an exact description —
