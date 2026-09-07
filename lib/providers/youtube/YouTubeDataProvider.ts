@@ -6,9 +6,13 @@ const YT_API_BASE = 'https://www.googleapis.com/youtube/v3';
 // time. youtube.readonly covers channel + video reads; yt-analytics.readonly
 // is requested for future watch-time/CTR ingestion even though this build
 // only uses the Data API's public statistics (views/likes/comments).
+// youtube.upload is the minimal scope for videos.insert — added for
+// publishing; existing connections made before this scope existed need to
+// reconnect once (prompt=consent below forces a fresh grant every time).
 export const YOUTUBE_SCOPES = [
   'https://www.googleapis.com/auth/youtube.readonly',
   'https://www.googleapis.com/auth/yt-analytics.readonly',
+  'https://www.googleapis.com/auth/youtube.upload',
 ].join(' ');
 
 export function getYouTubeAuthUrl(redirectUri: string, state: string): string {
@@ -69,6 +73,85 @@ export async function refreshAccessToken(refreshToken: string): Promise<TokenRes
   }
   return res.json();
 }
+
+export interface UploadVideoParams {
+  accessToken: string;
+  videoBuffer: Buffer;
+  title: string;
+  description: string;
+  tags: string[];
+  /** 'public' or 'unlisted' for immediate publish; ALWAYS 'private' when publishAt is set — YouTube auto-flips it to public at that time, which is how scheduling works (no local cron needed). */
+  privacyStatus: 'public' | 'unlisted' | 'private';
+  /** ISO 8601 timestamp. When set, privacyStatus must be 'private' — YouTube itself holds the video and publishes it at this time. */
+  publishAt?: string;
+}
+
+export interface UploadVideoResult {
+  videoId: string;
+  url: string;
+}
+
+/**
+ * Uploads a video via YouTube Data API v3's resumable upload protocol:
+ * 1) POST metadata, get back a session URL in the Location header
+ * 2) PUT the actual video bytes to that session URL
+ * Single-shot PUT (no chunking) — fine for typical short-form video sizes;
+ * add chunked retry-on-failure logic here if you start uploading much
+ * larger files and see it timing out or failing on rewatch/spotty wifi.
+ */
+export async function uploadVideo(params: UploadVideoParams): Promise<UploadVideoResult> {
+  if (params.publishAt && params.privacyStatus !== 'private') {
+    throw new Error('privacyStatus must be "private" when scheduling with publishAt — YouTube requires this.');
+  }
+
+  const metadata = {
+    snippet: {
+      title: params.title.slice(0, 100), // YouTube's hard title length limit
+      description: params.description.slice(0, 5000), // YouTube's hard description length limit
+      tags: params.tags.slice(0, 500),
+      categoryId: '22', // "People & Blogs" — reasonable default for short-form personal content
+    },
+    status: {
+      privacyStatus: params.privacyStatus,
+      selfDeclaredMadeForKids: false,
+      ...(params.publishAt ? { publishAt: params.publishAt } : {}),
+    },
+  };
+
+  const initRes = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${params.accessToken}`,
+      'Content-Type': 'application/json; charset=UTF-8',
+      'X-Upload-Content-Type': 'video/mp4',
+      'X-Upload-Content-Length': String(params.videoBuffer.length),
+    },
+    body: JSON.stringify(metadata),
+  });
+
+  if (!initRes.ok) {
+    console.error('YouTube upload init failed:', await initRes.text().catch(() => ''));
+    throw new Error('Could not start the YouTube upload.');
+  }
+
+  const uploadUrl = initRes.headers.get('location');
+  if (!uploadUrl) throw new Error('YouTube did not return an upload session URL.');
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(params.videoBuffer.length) },
+    body: new Uint8Array(params.videoBuffer),
+  });
+
+  if (!uploadRes.ok) {
+    console.error('YouTube video upload failed:', await uploadRes.text().catch(() => ''));
+    throw new Error('The video upload to YouTube failed partway through. Please try again.');
+  }
+
+  const created = await uploadRes.json();
+  return { videoId: created.id, url: `https://youtu.be/${created.id}` };
+}
+
 
 export interface YouTubeChannelInfo {
   channelId: string;

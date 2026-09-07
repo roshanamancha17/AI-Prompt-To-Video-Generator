@@ -140,7 +140,6 @@ enum ImageProviderMode {
   RTX
 }
 
-
 model Project {
   id       String @id @default(cuid())
   userId   String
@@ -512,7 +511,11 @@ model Schedule {
   platform      SocialPlatform
   scheduledFor  DateTime
   status        String         @default("PENDING")
+  privacyStatus String         @default("public")
+  publishedUrl  String?
+  errorMessage  String?        @db.Text
   createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 }

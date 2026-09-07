@@ -314,6 +314,46 @@ export function WorkspaceClient({ project }: { project: ProjectWithRelations }) 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
+  // --- YouTube publish/schedule ---
+  const [ytStatus, setYtStatus] = useState<{ connected: boolean; channelTitle?: string } | null>(null);
+  const [ytPrivacy, setYtPrivacy] = useState<'public' | 'unlisted'>('public');
+  const [ytScheduleAt, setYtScheduleAt] = useState('');
+  const [ytResult, setYtResult] = useState<{ url: string } | null>(null);
+  const [ytError, setYtError] = useState<string | null>(null);
+
+  const loadYtStatus = async () => {
+    const res = await fetch('/api/platforms/youtube/status');
+    const body = await res.json();
+    if (res.ok) setYtStatus(body);
+  };
+
+  useEffect(() => {
+    if (activeTab === 'Publish') loadYtStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  const publishYoutube = async (mode: 'now' | 'schedule') => {
+    setBusy(`youtube-${mode}`);
+    setYtError(null);
+    setYtResult(null);
+    const res = await fetch(`/api/projects/${project.id}/publish/youtube`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        mode === 'now'
+          ? { mode: 'now', privacyStatus: ytPrivacy }
+          : { mode: 'schedule', scheduledFor: new Date(ytScheduleAt).toISOString() },
+      ),
+    });
+    const body = await res.json();
+    setBusy(null);
+    if (!res.ok) {
+      setYtError(body.error || 'Publishing to YouTube failed.');
+      return;
+    }
+    setYtResult(body.result);
+  };
+
   return (
     <div className="max-w-5xl">
       <div className="mb-6 flex items-start justify-between">
@@ -744,6 +784,88 @@ export function WorkspaceClient({ project }: { project: ProjectWithRelations }) 
                     </div>
                   ))}
                 </div>
+              )}
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <h2 className="text-sm font-medium text-paper-100">Publish to YouTube</h2>
+            </CardHeader>
+            <CardBody className="space-y-4">
+              {!ytStatus ? (
+                <p className="text-sm text-ink-500">Checking connection…</p>
+              ) : !ytStatus.connected ? (
+                <div>
+                  <p className="mb-3 text-sm text-ink-500">Connect your YouTube channel to publish directly from here.</p>
+                  <a href="/api/platforms/youtube/connect">
+                    <Button>Connect YouTube</Button>
+                  </a>
+                </div>
+              ) : (
+                <>
+                  <p className="text-sm text-ink-500">
+                    Connected as <span className="text-paper-100">{ytStatus.channelTitle}</span>
+                  </p>
+
+                  {!renders.some((r) => r.status === 'COMPLETED') ? (
+                    <p className="text-sm text-ink-500">Render a video first — publishing needs a completed render.</p>
+                  ) : (
+                    <>
+                      {ytError && <p className="text-sm text-alert-red">{ytError}</p>}
+                      {ytResult && (
+                        <p className="text-sm text-ready-mint">
+                          Done —{' '}
+                          <a href={ytResult.url} target="_blank" rel="noreferrer" className="underline">
+                            {ytResult.url}
+                          </a>
+                        </p>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-500">Visibility (Publish Now)</label>
+                          <select
+                            value={ytPrivacy}
+                            onChange={(e) => setYtPrivacy(e.target.value as 'public' | 'unlisted')}
+                            className="w-full rounded-md border border-ink-600 bg-ink-900 px-3 py-2 text-sm text-paper-100"
+                          >
+                            <option value="public">Public</option>
+                            <option value="unlisted">Unlisted</option>
+                          </select>
+                        </div>
+                        <div className="flex items-end">
+                          <Button className="w-full" onClick={() => publishYoutube('now')} disabled={busy === 'youtube-now' || busy === 'youtube-schedule'}>
+                            {busy === 'youtube-now' ? 'Publishing…' : 'Publish Now'}
+                          </Button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-4 border-t border-ink-700 pt-4">
+                        <div>
+                          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-500">Schedule for</label>
+                          <input
+                            type="datetime-local"
+                            value={ytScheduleAt}
+                            onChange={(e) => setYtScheduleAt(e.target.value)}
+                            className="w-full rounded-md border border-ink-600 bg-ink-900 px-3 py-2 text-sm text-paper-100"
+                          />
+                          <p className="mt-1 text-[11px] text-ink-500">Uploads privately now; YouTube publishes it automatically at this time.</p>
+                        </div>
+                        <div className="flex items-end">
+                          <Button
+                            className="w-full"
+                            variant="secondary"
+                            onClick={() => publishYoutube('schedule')}
+                            disabled={!ytScheduleAt || busy === 'youtube-now' || busy === 'youtube-schedule'}
+                          >
+                            {busy === 'youtube-schedule' ? 'Scheduling…' : 'Schedule'}
+                          </Button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </>
               )}
             </CardBody>
           </Card>
